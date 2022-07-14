@@ -1,0 +1,335 @@
+@file:Suppress("DEPRECATION")
+
+package com.saraiva.felipe.mycamera.domain
+
+import android.Manifest
+import android.content.Context
+import android.graphics.Bitmap
+import android.graphics.BitmapFactory
+import android.graphics.SurfaceTexture
+import android.hardware.camera2.*
+import android.media.Image
+import android.media.ImageReader
+import android.media.MediaRecorder
+import android.os.Handler
+import android.os.HandlerThread
+import android.util.Size
+import android.view.Surface
+import android.view.TextureView
+import androidx.annotation.RequiresPermission
+import com.saraiva.felipe.mycamera.domain.CameraImageProcessExtension.getImageReader
+import com.saraiva.felipe.mycamera.domain.CameraImageProcessExtension.resizeBitmap
+import com.saraiva.felipe.mycamera.presentation.CameraFragment.Companion.MAX_PREVIEW_HEIGHT
+import com.saraiva.felipe.mycamera.presentation.CameraFragment.Companion.MAX_PREVIEW_WIDTH
+import com.saraiva.felipe.mycamera.presentation.CameraFragment.Companion.ORIENTATIONS
+import com.saraiva.felipe.mycamera.presentation.CameraFragment.Companion.VIDEO_ENCODING_BITRATE
+import java.io.ByteArrayInputStream
+import java.io.File
+import java.io.FileNotFoundException
+import java.io.IOException
+import java.nio.ByteBuffer
+import java.util.*
+import kotlin.io.path.absolutePathString
+
+enum class FlashMode {
+    FLASH_MODE_OFF, FLASH_MODE_ON, FLASH_MODE_AUTO
+}
+
+class CameraController(
+    context: Context,
+    private val previewSize: Size
+) {
+
+    /**
+     * State Variables
+     */
+    private var isRecording: Boolean = false
+    private var flashMode: FlashMode = FlashMode.FLASH_MODE_OFF
+    private var currentCamera = 0
+    private var mFlashSupported: Boolean = false
+    private var mRotation = 0
+
+    private var onImageAvailable: ((Bitmap) -> Unit)? = null
+    private var onRecordingAvailable: ((String) -> Unit)? = null
+
+    private var _textureView: TextureView? = null
+    private val textureView get() = requireNotNull(_textureView)
+
+    private var mediaRecorder: MediaRecorder? = null
+    private var mBackgroundHandler: Handler? = null
+    private var mBackgroundThread: HandlerThread? = null
+    private var mainHandler = Handler()
+
+    private var cameraDevice: CameraDevice? = null
+    private var _cameraManager : CameraManager? = null
+    private val manager get() = requireNotNull(_cameraManager)
+
+    private var previewCaptureRequestBuilder: CaptureRequest.Builder? = null
+    private var mainCaptureRequestBuilder: CaptureRequest.Builder? = null
+
+    private var cameraCaptureSession: CameraCaptureSession? = null
+    private var videoCaptureSession: CameraCaptureSession? = null
+
+    init {
+        _cameraManager = context.getSystemService(Context.CAMERA_SERVICE) as CameraManager?
+    }
+
+    fun setTextureView(textureView: TextureView) {
+        _textureView = textureView
+    }
+
+    fun setOnImageAvailable(listener: (Bitmap) -> Unit) {
+        onImageAvailable = listener
+    }
+
+    fun createCameraPreview() = runCatching {
+        val texture = textureView.surfaceTexture!!
+        texture.setDefaultBufferSize(previewSize.width, previewSize.height)
+        val surface = Surface(texture)
+        previewCaptureRequestBuilder = cameraDevice?.createCaptureRequest(CameraDevice.TEMPLATE_PREVIEW)
+        previewCaptureRequestBuilder?.addTarget(surface)
+        cameraDevice?.createCaptureSession(listOf(surface), cameraPreviewStateCallback, mainHandler)
+    }
+
+    fun updatePreview(captureSession: CameraCaptureSession) {
+        if (null == cameraDevice) return
+        val controlMode = if (isRecording) CameraMetadata.CONTROL_AF_MODE_CONTINUOUS_VIDEO else CameraMetadata.CONTROL_MODE_AUTO
+        previewCaptureRequestBuilder?.set(CaptureRequest.CONTROL_MODE, controlMode)
+        runCatching {
+            captureSession.setRepeatingRequest(
+                previewCaptureRequestBuilder!!.build(),
+                null,
+                mBackgroundHandler
+            )
+        }
+    }
+
+    @RequiresPermission(Manifest.permission.CAMERA)
+    fun openCamera() {
+        runCatching {
+            cameraDevice?.close()
+            val cameraId = manager.cameraIdList[currentCamera]
+            // Add permission for camera and let user grant the permission
+            mainHandler.post { manager.openCamera(cameraId, stateCallback, mainHandler) }
+        }
+    }
+
+    /**
+     * Photo Capture
+     */
+
+    private fun setupCaptureBuilder(imageReader: ImageReader): CaptureRequest.Builder {
+        return cameraDevice!!.createCaptureRequest(CameraDevice.TEMPLATE_STILL_CAPTURE).apply {
+            addTarget(imageReader.surface)
+            set(CaptureRequest.CONTROL_MODE, CameraMetadata.CONTROL_MODE_AUTO)
+            if (mFlashSupported) {
+                when (flashMode) {
+                    FlashMode.FLASH_MODE_OFF -> set(CaptureRequest.FLASH_MODE, CaptureRequest.FLASH_MODE_OFF)
+                    FlashMode.FLASH_MODE_ON -> set(CaptureRequest.FLASH_MODE, CaptureRequest.FLASH_MODE_SINGLE)
+                    FlashMode.FLASH_MODE_AUTO -> set(CaptureRequest.CONTROL_AE_MODE, CaptureRequest.CONTROL_AE_MODE_ON_AUTO_FLASH)
+                }
+            }
+            // Orientation
+            set(CaptureRequest.JPEG_ORIENTATION, ORIENTATIONS[mRotation])
+        }
+    }
+
+    fun takePicture() = runCatching {
+        cameraDevice?.let { device ->
+            val characteristics = manager.getCameraCharacteristics(device.id)
+            mFlashSupported = characteristics[CameraCharacteristics.FLASH_INFO_AVAILABLE] == true
+            val reader: ImageReader = getImageReader(characteristics, Size(MAX_PREVIEW_WIDTH, MAX_PREVIEW_HEIGHT))
+            val outputSurfaces = listOf(reader.surface, Surface(textureView.surfaceTexture))
+            mainCaptureRequestBuilder = setupCaptureBuilder(reader).also {
+                mainHandler.post {
+                    reader.setOnImageAvailableListener(imageReader, mBackgroundHandler)
+                    device.createCaptureSession(outputSurfaces, object: CameraCaptureSession.StateCallback() {
+                        override fun onConfigured(session: CameraCaptureSession) {
+                            session.capture(it.build(), captureCallback, mainHandler)
+                        }
+
+                        override fun onConfigureFailed(session: CameraCaptureSession) = Unit
+                    } , mainHandler)
+                }
+            }
+        }
+    }
+
+    /**
+     * Video stuff
+     */
+
+    private fun setupMediaRecorder() {
+        mediaRecorder = MediaRecorder().apply {
+            val file = kotlin.io.path.createTempFile(UUID.randomUUID().toString(), ".mp4")
+            setVideoSource(MediaRecorder.VideoSource.SURFACE)
+            setAudioSource(MediaRecorder.AudioSource.MIC)
+
+            setOutputFormat(MediaRecorder.OutputFormat.MPEG_4)
+
+            setVideoSize(MAX_PREVIEW_WIDTH, MAX_PREVIEW_HEIGHT)
+            setVideoFrameRate(30)
+            setVideoEncoder(MediaRecorder.VideoEncoder.H264)
+            setVideoEncodingBitRate(VIDEO_ENCODING_BITRATE)
+            setMaxDuration(20000)
+
+            setAudioChannels(2)
+            setOutputFile(file.absolutePathString())
+            setAudioEncoder(MediaRecorder.AudioEncoder.AAC)
+            setOnInfoListener { _, what, _ ->
+                if (what == MediaRecorder.MEDIA_RECORDER_INFO_MAX_DURATION_REACHED) {
+                    onRecordingAvailable?.invoke(file.absolutePathString())
+                }
+            }
+
+            val characteristics = cameraDevice?.let { manager.getCameraCharacteristics(it.id) }
+            val rotation = when (characteristics?.get(CameraCharacteristics.LENS_FACING)) {
+                CameraMetadata.LENS_FACING_FRONT -> 270
+                else -> 90
+            }
+            setOrientationHint(rotation)
+            setPreviewDisplay(Surface(textureView.surfaceTexture))
+            prepare()
+        }
+    }
+
+    fun startRecording() {
+        isRecording = true
+        val surfaceTexture: SurfaceTexture? = textureView.surfaceTexture?.apply {
+            setDefaultBufferSize(MAX_PREVIEW_WIDTH, MAX_PREVIEW_HEIGHT)
+        }
+        val previewSurface = Surface(surfaceTexture)
+        mediaRecorder?.let {
+            val outputSurfaces = mutableListOf(previewSurface, it.surface)
+            mainCaptureRequestBuilder =
+                cameraDevice?.createCaptureRequest(CameraDevice.TEMPLATE_RECORD)?.apply {
+                    addTarget(previewSurface)
+                    addTarget(it.surface)
+                }
+            cameraDevice?.createCaptureSession(outputSurfaces, videoStateCallback, mBackgroundHandler)
+        }
+    }
+
+    fun stopRecording() {
+        if (isRecording) {
+            mediaRecorder?.stop()
+            mediaRecorder?.reset()
+        }
+        isRecording = false
+    }
+
+    /**
+     * Thread management
+     */
+
+    fun startBackgroundThread() {
+        mBackgroundThread = HandlerThread("Camera Background")
+        mBackgroundThread?.start()
+        mBackgroundHandler = Handler(mBackgroundThread!!.looper)
+    }
+
+    fun stopBackgroundThread() {
+
+        if (isRecording) runCatching { mediaRecorder?.reset() }
+        mediaRecorder?.release()
+        mBackgroundThread?.quitSafely()
+        try {
+            mBackgroundThread?.join()
+            mBackgroundThread = null
+            mBackgroundHandler = null
+        } catch (e: InterruptedException) {
+            e.printStackTrace()
+        }
+    }
+
+    /**
+     * Callbacks
+     */
+
+    private val stateCallback = object: CameraDevice.StateCallback() {
+        override fun onOpened(camera: CameraDevice) {
+            cameraDevice = camera
+            mFlashSupported =
+                manager.getCameraCharacteristics(camera.id)[CameraCharacteristics.FLASH_INFO_AVAILABLE] == true
+            mainHandler.post { createCameraPreview() }
+        }
+
+        override fun onDisconnected(camera: CameraDevice) {
+            cameraDevice?.close()
+        }
+
+        override fun onError(camera: CameraDevice, error: Int) {
+            cameraDevice?.close()
+            cameraDevice = null
+        }
+
+    }
+
+    private val cameraPreviewStateCallback = object: CameraCaptureSession.StateCallback() {
+        override fun onConfigured(cs: CameraCaptureSession) {
+            if (null == cameraDevice) return //The camera is already closed
+            // When the session is ready, we start displaying the preview.
+            cameraCaptureSession = cs
+            mainHandler.post { updatePreview(cs) }
+        }
+
+        override fun onConfigureFailed( cs: CameraCaptureSession) = Unit
+
+    }
+
+    private val captureCallback = object : CameraCaptureSession.CaptureCallback() {
+        override fun onCaptureCompleted(
+            session: CameraCaptureSession,
+            request: CaptureRequest,
+            result: TotalCaptureResult
+        ) {
+            super.onCaptureCompleted(session, request, result)
+            mainHandler.post { createCameraPreview() }
+        }
+    }
+
+    private val videoStateCallback = object : CameraCaptureSession.StateCallback() {
+        override fun onConfigured(session: CameraCaptureSession) {
+            videoCaptureSession = session
+            mainCaptureRequestBuilder?.let {
+                session.setRepeatingRequest(it.build(), null, mBackgroundHandler)
+                isRecording = true
+                mediaRecorder?.start()
+            }
+        }
+
+        override fun onConfigureFailed(s: CameraCaptureSession) = Unit
+
+    }
+
+    private val imageReader = ImageReader.OnImageAvailableListener { reader ->
+        var image: Image? = null
+        try {
+            image = reader.acquireLatestImage()
+            val buffer: ByteBuffer = image.planes[0].buffer
+            val bytes = ByteArray(buffer.capacity())
+            buffer.get(bytes)
+            val exifInterface =
+                androidx.exifinterface.media.ExifInterface(ByteArrayInputStream(bytes))
+            val characteristics =
+                cameraDevice?.let { manager.getCameraCharacteristics(it.id) }
+            var rotation = exifInterface.rotationDegrees
+            if (characteristics?.get(CameraCharacteristics.LENS_FACING) == CameraMetadata.LENS_FACING_FRONT)
+                rotation += 180 //degrees
+
+            val bitmap = resizeBitmap(
+                BitmapFactory.decodeByteArray(bytes, 0, bytes.size),
+                rotation
+            )
+            mainHandler.post {
+                onImageAvailable?.invoke(bitmap)
+            }
+        } catch (e: FileNotFoundException) {
+            e.printStackTrace()
+        } catch (e: IOException) {
+            e.printStackTrace()
+        } finally {
+            image?.close()
+        }
+    }
+}
