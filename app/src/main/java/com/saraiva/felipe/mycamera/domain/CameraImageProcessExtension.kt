@@ -1,12 +1,7 @@
 package com.saraiva.felipe.mycamera.domain
 
 import android.graphics.Bitmap
-import android.graphics.ImageFormat
 import android.graphics.Matrix
-import android.hardware.camera2.CameraCharacteristics
-import android.media.ImageReader
-import android.util.Size
-import com.saraiva.felipe.mycamera.presentation.CameraFragment.Companion.MAX_SIZE
 import java.io.FileOutputStream
 import java.nio.file.Path
 import java.util.*
@@ -14,18 +9,7 @@ import kotlin.io.path.absolutePathString
 
 object CameraImageProcessExtension {
 
-    fun CameraController.getImageReader(cameraCharacteristics: CameraCharacteristics, defaultSize: Size): ImageReader {
-        val jpegSizes: Array<Size>? =
-            cameraCharacteristics.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP)!!
-                .getOutputSizes(ImageFormat.JPEG)
-        var width = defaultSize.width
-        var height = defaultSize.height
-        if (jpegSizes != null && jpegSizes.isNotEmpty()) {
-            width = jpegSizes[0].width
-            height = jpegSizes[0].height
-        }
-        return ImageReader.newInstance(width, height, ImageFormat.JPEG, 1)
-    }
+    private const val MAX_SIZE = 2048
 
     fun resizeBitmap(bitmap: Bitmap, orientation: Int): Bitmap {
         var width: Int = bitmap.width
