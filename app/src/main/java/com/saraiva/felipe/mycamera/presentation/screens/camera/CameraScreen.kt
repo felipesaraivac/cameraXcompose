@@ -1,4 +1,4 @@
-package com.saraiva.felipe.mycamera.presentation.screens.preview
+package com.saraiva.felipe.mycamera.presentation.screens.camera
 
 import android.content.Context
 import android.graphics.BitmapFactory
@@ -23,11 +23,12 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.constraintlayout.compose.ConstraintLayout
 import androidx.core.content.ContextCompat
+import androidx.lifecycle.viewmodel.compose.viewModel
 import androidx.navigation.NavHostController
-import com.saraiva.felipe.mycamera.domain.CameraImageProcessExtension
+import com.saraiva.felipe.mycamera.presentation.CameraVideoModel
 import com.saraiva.felipe.mycamera.presentation.navigation.Screen
-import com.saraiva.felipe.mycamera.presentation.screens.preview.CameraController.CameraPreview
-import com.saraiva.felipe.mycamera.presentation.screens.preview.CameraController.takePicture
+import com.saraiva.felipe.mycamera.presentation.screens.camera.CameraController.CameraPreview
+import com.saraiva.felipe.mycamera.presentation.screens.camera.CameraController.takePicture
 import kotlinx.coroutines.launch
 import java.io.ByteArrayInputStream
 import java.nio.ByteBuffer
@@ -35,10 +36,11 @@ import java.nio.file.Path
 import java.util.concurrent.Executor
 import kotlin.coroutines.resume
 import kotlin.coroutines.suspendCoroutine
+import kotlin.io.path.absolutePathString
 
 
 @Composable
-fun CameraScreen(navController: NavHostController) {
+fun CameraScreen(navController: NavHostController, vm: CameraVideoModel = viewModel()) {
     ConstraintLayout {
         val (preview, cameraBtn) = createRefs()
         val context = LocalContext.current
@@ -52,7 +54,8 @@ fun CameraScreen(navController: NavHostController) {
         Button(
             onClick = {
                 takePicture(context = context) {
-                    navController.navigate(Screen.PictureScreen.withFile(it))
+                    vm.imageFilePicture = it.absolutePathString()
+                    navController.navigate(Screen.PictureScreen.route)
                 }
             },
             Modifier.constrainAs(cameraBtn) {

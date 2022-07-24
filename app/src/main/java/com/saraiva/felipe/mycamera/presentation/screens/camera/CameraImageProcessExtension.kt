@@ -1,4 +1,4 @@
-package com.saraiva.felipe.mycamera.domain
+package com.saraiva.felipe.mycamera.presentation.screens.camera
 
 import android.graphics.Bitmap
 import android.graphics.Matrix

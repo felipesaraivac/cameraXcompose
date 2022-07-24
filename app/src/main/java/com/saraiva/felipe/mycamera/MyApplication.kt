@@ -5,7 +5,9 @@ import android.app.Application
 import android.util.Log
 import androidx.camera.camera2.Camera2Config
 import androidx.camera.core.CameraXConfig
+import dagger.hilt.android.HiltAndroidApp
 
+@HiltAndroidApp
 class MyApplication: Application() , CameraXConfig.Provider {
 
     @SuppressLint("UnsafeOptInUsageError")
